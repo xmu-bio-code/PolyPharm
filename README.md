@@ -41,8 +41,7 @@ PolyPharm is a deep learning-based framework for multi-target drug design, capab
 git clone https://github.com/xmu-bio-code/PolyPharm.git
 cd PolyPharm
 ```
-
-- Or contact via email: niuziru@stu.xmu.edu.cn
+The pre-trained dataset can be downloaded from Zenodo.
 
 After download, extract and place the `data/` folder at the root directory.
 
