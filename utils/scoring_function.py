@@ -333,6 +333,24 @@ class MoleculewiseScoringFunction(ScoringFunction):
     def score_list(self, smiles_list: List[str]) -> List[float]:
         return [self.score(smiles) for smiles in tqdm(smiles_list, desc=self.__class__.__name__, position=1, leave=False)]
 
+    def score_list_with_failures(self, smiles_list):
+        """Return aligned scores and reasons (None for successful molecules)."""
+        scores, failures = [], []
+        for smiles in tqdm(smiles_list, desc=self.__class__.__name__, position=1, leave=False):
+            try:
+                raw_score = self.raw_score(smiles)
+            except (InvalidMolecule, Chem.rdchem.MolSanitizeException) as exc:
+                scores.append(0.0)
+                failures.append(f'{self.__class__.__name__}: {type(exc).__name__}: {exc}')
+                continue
+            # Modifier/model errors must not be mistaken for invalid chemistry.
+            score = self.modify_score(raw_score)
+            if not np.isfinite(raw_score) or not np.isfinite(score):
+                raise ValueError(f'{self.__class__.__name__} returned a non-finite score')
+            scores.append(score)
+            failures.append(None)
+        return scores, failures
+
     @abstractmethod
     def raw_score(self, smiles: str) -> float:
         """
@@ -364,13 +382,24 @@ class BatchScoringFunction(ScoringFunction):
         return self.score_list([smiles])[0]
 
     def score_list(self, smiles_list: List[str]) -> List[float]:
-        raw_scores = self.raw_score_list(smiles_list)
+        scores, p_a, p_b, failures = self.score_list_with_failures(smiles_list)
+        for index, reason in enumerate(failures):
+            if reason is not None:
+                raise InvalidMolecule(f'Input {index}: {reason}')
+        return [scores, p_a, p_b]
 
-        scores = [self.corrupt_score if raw_score is None
-                  else self.modify_score(raw_score)
-                  for raw_score in raw_scores[0]]
-
-        return [scores, raw_scores[1], raw_scores[2]]
+    def score_list_with_failures(self, smiles_list):
+        """Return total scores, two target scores, and aligned failure reasons."""
+        raw_scores, p_a, p_b, failures = self.raw_score_list(smiles_list)
+        if any(len(values) != len(smiles_list) for values in (raw_scores, p_a, p_b, failures)):
+            raise ValueError('Scoring output lengths do not match the input')
+        if any(reason is not None and not isinstance(reason, str) for reason in failures):
+            raise TypeError('Scoring failures must be strings or None')
+        scores = [0.0 if reason is not None else self.modify_score(raw_score)
+                  for raw_score, reason in zip(raw_scores, failures)]
+        if not all(np.isfinite(values).all() for values in (scores, p_a, p_b)):
+            raise ValueError('Scoring output contains non-finite values')
+        return [scores, p_a, p_b, failures]
 
     @abstractmethod
     def raw_score_list(self, smiles_list: List[str]) -> List[float]:
@@ -381,8 +410,8 @@ class BatchScoringFunction(ScoringFunction):
             smiles_list: list of SMILES strings to process
 
         Returns:
-            A list of scores. For unsuccessful calculations or invalid molecules, `None` should be given as a value for
-            the corresponding molecule.
+            Four aligned lists: total scores, two target scores, and failure reasons.
+            Reasons are None for successful molecules, otherwise descriptive strings.
         """
         raise NotImplementedError
 
@@ -436,11 +465,22 @@ class ArithmeticMeanScoringFunction(BatchScoringFunction):
     def raw_score_list(self, smiles_list: List[str]) -> List[float]:
         scores = []
         raw_scores = []
+        failures = [None] * len(smiles_list)
 
         for function, weight in tqdm(zip(self.scoring_functions, self.weights), desc="Scoring", position=0):
-            res = function.score_list(smiles_list)
-            scores.append(weight * np.array(res))
-            raw_scores.append(np.array(res))
+            indices = [i for i, reason in enumerate(failures) if reason is None]
+            res = np.zeros(len(smiles_list))
+            if indices:
+                values, reasons = function.score_list_with_failures([smiles_list[i] for i in indices])
+                if len(values) != len(indices) or len(reasons) != len(indices):
+                    raise ValueError(f'{function.__class__.__name__} returned misaligned scores')
+                for index, value, reason in zip(indices, values, reasons):
+                    if reason is None:
+                        res[index] = value
+                    else:
+                        failures[index] = reason
+            scores.append(weight * res)
+            raw_scores.append(res)
 
         scores = np.array(scores)
         raw_scores = np.array(raw_scores)
@@ -451,7 +491,10 @@ class ArithmeticMeanScoringFunction(BatchScoringFunction):
 
         scores = scores.sum(axis=0) / np.sum(self.weights)
 
-        return [list(scores), list(raw_scores[-2]), list(raw_scores[-1])]
+        failed = np.array([reason is not None for reason in failures], dtype=bool)
+        scores[failed] = 0.0
+        raw_scores[:, failed] = 0.0
+        return [list(scores), list(raw_scores[-2]), list(raw_scores[-1]), failures]
 
 
 class GeometricMeanScoringFunction(MoleculewiseScoringFunction):

@@ -7,6 +7,7 @@ import rdkit
 import torch
 import os
 import logging
+import json
 import time
 import joblib
 import numpy as np
@@ -181,9 +182,25 @@ def finetune(inint_population, model, tokenizer, objective, args):
         # add the new stuff to tracker
         seen.update(payload)
     
-        scores, p_a, p_b = objective.score_list(payload)
+        scores, p_a, p_b, scoring_failures = objective.score_list_with_failures(payload)
+        if any(len(values) != len(payload) for values in (scores, p_a, p_b, scoring_failures)):
+            raise ValueError('Scoring output lengths do not match payload')
+        failed_count = sum(reason is not None for reason in scoring_failures)
+        if failed_count:
+            with open(args.output_dir / 'scoring_failures.jsonl', 'a', encoding='utf-8') as handle:
+                for index, (smiles, reason) in enumerate(zip(payload, scoring_failures)):
+                    if reason is not None:
+                        handle.write(json.dumps({'epoch': epoch, 'index': index, 'smiles': smiles,
+                                                 'reason': reason}, ensure_ascii=False) + '\n')
         
-        int_results = [OptResult(smiles=smiles, score=score, p_a=p_a_i, p_b=p_b_i) for smiles, score, p_a_i, p_b_i in zip(payload, scores, p_a, p_b) if check_ppgraph(smiles)]
+        int_results = [OptResult(smiles=smiles, score=score, p_a=p_a_i, p_b=p_b_i)
+                       for smiles, score, p_a_i, p_b_i, reason in zip(payload, scores, p_a, p_b, scoring_failures)
+                       if reason is None and check_ppgraph(smiles)]
+        with open(args.output_dir / 'scoring_summary.jsonl', 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps({'epoch': epoch, 'scoring_input': len(payload),
+                                     'scoring_failed': failed_count,
+                                     'scoring_successful': len(payload) - failed_count,
+                                     'graph_valid_after_scoring': len(int_results)}) + '\n')
         int_results = sorted(int_results)
         
         # update threshold
@@ -194,6 +211,10 @@ def finetune(inint_population, model, tokenizer, objective, args):
         int_candidate_set = int_results[:args.keep_top]
         candidate_set += [s.smiles for s in int_candidate_set]
         elite_set += [s.smiles for s in int_candidate_set if s.score >= threshold]
+        if not candidate_set:
+            raise RuntimeError(f'Epoch {epoch}: no usable candidates; check scoring_summary.jsonl and scoring_failures.jsonl')
+        if args.optimize_n_epochs > 0 and not elite_set:
+            raise RuntimeError(f'Epoch {epoch}: no elites passed threshold {threshold}; no training was performed this round')
                
         np.random.shuffle(elite_set)
         print(f"elite size: {len(elite_set)}")

@@ -10,6 +10,7 @@ import joblib as skjoblib
 
 # guacamol
 from .scoring_function import MoleculewiseScoringFunction
+from .scoring_function import InvalidMolecule
 from .scoring_function import ArithmeticMeanScoringFunction
 from .scoring_function import ScoringFunctionBasedOnRdkitMol
 from .scoring_function import MinMaxGaussianModifier
@@ -113,13 +114,10 @@ class QED_custom(MoleculewiseScoringFunction):
 
     def raw_score(self, smiles: str) -> float:
         # determine score from self.model and the given smiles string
-        try:
-            mol = Chem.MolFromSmiles(smiles)
-            qed = Descriptors.qed(mol)
-            return qed
-        except:
-            # print(smiles)
-            raise Exception(smiles)
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None or mol.GetNumAtoms() == 0:
+            raise InvalidMolecule('SMILES could not be parsed into a nonempty molecule')
+        return Descriptors.qed(mol)
 
         
 
@@ -414,6 +412,8 @@ class SAScorer(MoleculewiseScoringFunction):
     def raw_score(self, smiles: str) -> float:
         # determine score from self.model and the given smiles string
         m = Chem.MolFromSmiles(smiles)
+        if m is None or m.GetNumAtoms() == 0:
+            raise InvalidMolecule('SMILES could not be parsed into a nonempty molecule')
         fp = rdMolDescriptors.GetMorganFingerprint(m, 2)  # <- 2 is the *radius* of the circular fingerprint
         fps = fp.GetNonzeroElements()
         score1 = 0.
@@ -512,7 +512,10 @@ class BindingScorer_Custom(MoleculewiseScoringFunction):
 
     def raw_score(self, smiles: str) -> float:
         # determine score from self.model and the given smiles string
-        fp = AllChem.GetMorganFingerprintAsBitVect(Chem.MolFromSmiles(smiles), 2, 2048)
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None or mol.GetNumAtoms() == 0:
+            raise InvalidMolecule('SMILES could not be parsed into a nonempty molecule')
+        fp = AllChem.GetMorganFingerprintAsBitVect(mol, 2, 2048)
         fp = np.array([fp])
         score = self.rfr.predict(fp)
         # print("raw:", score)
